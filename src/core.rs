@@ -470,10 +470,13 @@ impl Core {
         let mut m = HashMap::new();
         m.insert(meta_coord(), meta_content(self.checkpoint_seq));
         self.wal_text = phext::implode(m);
+        // clone before taking the file handle: wal_file() borrows
+        // all of self mutably, and the meta text is a few dozen bytes
+        let meta = self.wal_text.clone();
         let wal = self.wal_file()?;
         wal.set_len(0)?;
         wal.seek(SeekFrom::Start(0))?;
-        wal.write_all(self.wal_text.as_bytes())?;
+        wal.write_all(meta.as_bytes())?;
         wal.sync_all()?;
 
         *self.shared.base.write().unwrap() = Arc::new(BaseLattice::open(&self.base_path)?);
