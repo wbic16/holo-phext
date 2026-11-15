@@ -1,6 +1,6 @@
 [package]
 name = "holo-phext"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Layer2 over phext: a memory-mapped lattice with async I/O, update dispatch, and ACID multi-scroll transactions. The storage engine phext-lattice will be re-implemented on, and the durability layer for phext-native stores (HoloStore round 2)."
 license = "MIT"

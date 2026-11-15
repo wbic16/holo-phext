@@ -188,3 +188,24 @@ async fn read_only_open_creates_no_wal_file() {
     }
     cleanup(&base);
 }
+
+#[tokio::test]
+async fn recovery_over_many_transactions_is_linear() {
+    // Regression: recovery once verified each transaction by
+    // fetching from the raw WAL text — a whole-document parse per
+    // transaction, quadratic in the log. 3,000 transactions must
+    // reopen with every value intact, inside ordinary test time.
+    let dir = tempdir();
+    let path = dir.join("many.phext");
+    let store = HoloPhext::open(&path).await.unwrap();
+    for i in 0..3_000u32 {
+        store
+            .commit(Txn::new().set(c(9, 9, 9), &format!("v{i}")))
+            .await
+            .unwrap();
+    }
+    drop(store);
+    let store = HoloPhext::open(&path).await.unwrap();
+    assert_eq!(store.seq(), 3_000);
+    assert_eq!(store.read(&c(9, 9, 9)).as_deref(), Some("v2999"));
+}

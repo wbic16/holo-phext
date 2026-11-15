@@ -293,10 +293,45 @@ impl Core {
             }
             let (commit_at, entry_coords) = coords.split_last().unwrap();
             let mut ops: Vec<(Coordinate, Op)> = Vec::new();
-            let mut valid = phext::verify_commit(&wal_text, entry_coords, *commit_at);
+            // Verify from the exploded map — never by fetching from
+            // the raw text. libphext's fetch parses the whole
+            // document per call, so per-transaction verification over
+            // the text is quadratic in the WAL size (found by the
+            // HoloStore engine integration: recovery of a
+            // 10,050-transaction WAL spun for tens of minutes). From
+            // the map, recovery is linear in the file.
+            let pairs: Vec<(Coordinate, String)> = entry_coords
+                .iter()
+                .map(|c| (*c, exploded.get(c).cloned().unwrap_or_default()))
+                .collect();
+            let commit_body = exploded.get(commit_at).and_then(|raw| {
+                if phext::verify_checked_scroll(raw) {
+                    phext::uncheck_scroll(raw)
+                } else {
+                    None
+                }
+            });
+            let mut valid = match &commit_body {
+                Some(body) => {
+                    let mut check_input = String::new();
+                    for (c, checked) in &pairs {
+                        check_input += &c.to_string();
+                        check_input.push('\n');
+                        check_input += checked;
+                        check_input.push('\n');
+                    }
+                    *body
+                        == format!(
+                            "phext-commit:1\ncount={}\ncheck={}",
+                            pairs.len(),
+                            phext::checksum(&check_input)
+                        )
+                }
+                None => false,
+            };
             if valid {
-                for entry in entry_coords {
-                    match phext::fetch_checked(&wal_text, *entry)
+                for (_c, checked) in &pairs {
+                    match phext::uncheck_scroll(checked)
                         .and_then(|body| parse_entry(&body))
                     {
                         Some(op) => ops.push(op),
