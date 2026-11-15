@@ -44,6 +44,13 @@ impl LatticeStore {
         Ok(LatticeStore { core, staged: BTreeMap::new(), path: path.as_ref().to_path_buf() })
     }
 
+    /// Opens with a prebuilt index for the base document, skipping
+    /// the scan (see `Core::open_with_index`).
+    pub fn open_with_index<P: AsRef<Path>>(path: P, index: crate::index::LatticeIndex) -> io::Result<LatticeStore> {
+        let core = Core::open_with_index(path.as_ref(), index)?;
+        Ok(LatticeStore { core, staged: BTreeMap::new(), path: path.as_ref().to_path_buf() })
+    }
+
     pub fn read_scroll(&self, coord: &Coordinate) -> Option<String> {
         if let Some(entry) = self.staged.get(coord) {
             return entry.clone();

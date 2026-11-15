@@ -85,6 +85,28 @@ impl BaseLattice {
         Ok(BaseLattice { map: Some(map), index })
     }
 
+    /// Opens with an index built elsewhere (e.g. a persisted span
+    /// table), skipping the scan. The index must describe exactly
+    /// this file's bytes.
+    pub fn open_with_index(path: &Path, index: LatticeIndex) -> io::Result<BaseLattice> {
+        if !path.exists() {
+            File::create(path)?;
+        }
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        if len as usize != index.buffer_len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("index covers {} bytes but the base file has {}", index.buffer_len(), len),
+            ));
+        }
+        if len == 0 {
+            return Ok(BaseLattice { map: None, index });
+        }
+        let map = unsafe { Mmap::map(&file)? };
+        Ok(BaseLattice { map: Some(map), index })
+    }
+
     pub fn read_scroll(&self, coord: &Coordinate) -> Option<String> {
         let span = self.index.get(coord)?;
         let map = self.map.as_ref()?;
@@ -222,8 +244,18 @@ pub struct Core {
 
 impl Core {
     pub fn open(base_path: &Path) -> io::Result<Core> {
+        Self::open_inner(base_path, BaseLattice::open(base_path)?)
+    }
+
+    /// Opens with a prebuilt index for the base document — the
+    /// scan happens exactly once, in the caller (phext-lattice's
+    /// open path builds it for its own navigation anyway).
+    pub fn open_with_index(base_path: &Path, index: LatticeIndex) -> io::Result<Core> {
+        Self::open_inner(base_path, BaseLattice::open_with_index(base_path, index)?)
+    }
+
+    fn open_inner(base_path: &Path, base: BaseLattice) -> io::Result<Core> {
         let wal_path = wal_path_for(base_path);
-        let base = BaseLattice::open(base_path)?;
 
         // ---- load or create the WAL ----
         let wal_existed = wal_path.exists();
