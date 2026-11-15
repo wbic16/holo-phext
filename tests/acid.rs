@@ -200,12 +200,12 @@ async fn recovery_over_many_transactions_is_linear() {
     let store = HoloPhext::open(&path).await.unwrap();
     for i in 0..3_000u32 {
         store
-            .commit(Txn::new().set(c(9, 9, 9), &format!("v{i}")))
+            .commit(Txn::new().set(coord("9.9.9/9.9.9/9.9.9"), &format!("v{i}")))
             .await
             .unwrap();
     }
     drop(store);
     let store = HoloPhext::open(&path).await.unwrap();
     assert_eq!(store.seq(), 3_000);
-    assert_eq!(store.read(&c(9, 9, 9)).as_deref(), Some("v2999"));
+    assert_eq!(store.read(&coord("9.9.9/9.9.9/9.9.9")).as_deref(), Some("v2999"));
 }
