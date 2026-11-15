@@ -209,3 +209,35 @@ async fn recovery_over_many_transactions_is_linear() {
     drop(store);
     cleanup(&base);
 }
+
+#[test]
+fn one_giant_batch_and_a_torn_utf8_tail() {
+    // The HoloStore server's shape: thousands of transactions in
+    // ONE commit_batch, then a crash that splits a UTF-8 sequence
+    // at the WAL's tail. Both were defects when the engine chained
+    // libphext::append_batch per transaction and read the WAL with
+    // read_to_string.
+    use holo_phext::core::Core;
+    let base = temp_store("giant");
+    let key = coord("9.9.9/9.9.9/9.9.9");
+    let mut core = Core::open(&base).unwrap();
+    let txns: Vec<Txn> = (0..3_000u32)
+        .map(|i| Txn::new().set(key, &format!("v{i}")))
+        .collect();
+    let seqs = core.commit_batch(txns).unwrap();
+    assert_eq!(seqs.len(), 3_000);
+    assert_eq!(core.shared.snapshot().get(&key).as_deref(), Some("v2999"));
+    drop(core);
+    // Torn tail: partial scroll, then bytes that are not UTF-8.
+    let wal = base.with_file_name("store.wal.phext");
+    let mut f = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+    use std::io::Write;
+    f.write_all(b"\x1c\x19partial").unwrap();
+    f.write_all(&[0xFF, 0xFE, 0x00]).unwrap();
+    drop(f);
+    let core = Core::open(&base).unwrap();
+    assert_eq!(core.seq(), 3_000);
+    assert_eq!(core.shared.snapshot().get(&key).as_deref(), Some("v2999"));
+    drop(core);
+    cleanup(&base);
+}

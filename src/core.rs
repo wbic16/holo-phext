@@ -195,6 +195,34 @@ fn meta_coord() -> Coordinate {
     phext::to_coordinate("1.1.1/1.1.1/1.1.1")
 }
 
+/// Delimiter bytes, highest dimension first (library .. scroll).
+const BREAKS: [u8; 9] = [0x01, 0x1F, 0x1E, 0x1D, 0x1C, 0x1A, 0x19, 0x18, 0x17];
+
+fn comps(c: &Coordinate) -> [usize; 9] {
+    [
+        c.z.library, c.z.shelf, c.z.series, c.y.collection, c.y.volume, c.y.book, c.x.chapter,
+        c.x.section, c.x.scroll,
+    ]
+}
+
+/// Emit delimiter bytes that advance `cur` to `tgt` (tgt must not
+/// precede cur). A break increments its dimension and resets all
+/// lower dimensions to 1 — the phext addressing rule, applied
+/// forwards. This is the engine's append cursor at work: extending
+/// the WAL is O(batch), with no re-parse of the existing log.
+fn emit_until(out: &mut Vec<u8>, cur: &mut [usize; 9], tgt: [usize; 9]) {
+    while *cur != tgt {
+        let i = (0..9)
+            .find(|&i| cur[i] < tgt[i])
+            .expect("append target precedes current coordinate");
+        out.push(BREAKS[i]);
+        cur[i] += 1;
+        for j in i + 1..9 {
+            cur[j] = 1;
+        }
+    }
+}
+
 fn entry_coord(seq: u64, index: usize) -> Coordinate {
     phext::to_coordinate(&format!("1.1.1/1.{}.1/2.1.{}", seq, index))
 }
@@ -237,6 +265,10 @@ pub struct Core {
     /// must not create the WAL file beside the document.
     wal_file: Option<File>,
     wal_text: String,
+    /// Components of the WAL's last non-empty scroll — the append
+    /// cursor. Maintained by open/commit/checkpoint so extending
+    /// the log never re-parses it.
+    wal_last: [usize; 9],
     next_seq: u64,
     checkpoint_seq: u64,
     pub shared: Arc<Shared>,
@@ -260,9 +292,21 @@ impl Core {
         // ---- load or create the WAL ----
         let wal_existed = wal_path.exists();
         let mut wal_text = if wal_existed {
-            let mut s = String::new();
-            File::open(&wal_path)?.read_to_string(&mut s)?;
-            s
+            let bytes = std::fs::read(&wal_path)?;
+            // A torn final write can split a UTF-8 sequence; the
+            // valid prefix is the log. Truncate the file to it
+            // before replay — the partial tail is not a transaction
+            // and must not sit where appends will land.
+            let valid = match std::str::from_utf8(&bytes) {
+                Ok(_) => bytes.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            if valid < bytes.len() {
+                let f = OpenOptions::new().write(true).open(&wal_path)?;
+                f.set_len(valid as u64)?;
+                f.sync_all()?;
+            }
+            String::from_utf8(bytes[..valid].to_vec()).unwrap_or_default()
         } else {
             let mut m = HashMap::new();
             m.insert(meta_coord(), meta_content(0));
@@ -357,6 +401,11 @@ impl Core {
 
         let _ = wal_existed;
 
+        let wal_last = phext::explode(&wal_text)
+            .keys()
+            .max()
+            .map(|c| comps(c))
+            .unwrap_or_else(|| comps(&meta_coord()));
         let shared = Arc::new(Shared {
             base: RwLock::new(Arc::new(base)),
             overlay: RwLock::new(Arc::new(overlay)),
@@ -367,6 +416,7 @@ impl Core {
             wal_path,
             wal_file: None,
             wal_text,
+            wal_last,
             next_seq: applied_seq + 1,
             checkpoint_seq,
             shared,
@@ -436,20 +486,18 @@ impl Core {
         let mut seqs = Vec::with_capacity(txns.len());
         let start_seq = self.next_seq;
         let old_len = self.wal_text.len();
-        let mut text = std::mem::take(&mut self.wal_text);
+        // Validate and serialize every transaction first; nothing
+        // is mutated until the whole batch is known-good.
+        let mut all_entries: Vec<Vec<(Coordinate, String)>> = Vec::with_capacity(txns.len());
         for txn in &txns {
             if txn.is_empty() {
-                self.wal_text = text;
-                self.next_seq = start_seq;
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty transaction"));
             }
-            let seq = self.next_seq;
+            let seq = start_seq + all_entries.len() as u64;
             let mut entries: Vec<(Coordinate, String)> = Vec::with_capacity(txn.ops.len() + 1);
             for (i, (coord, op)) in txn.ops.iter().enumerate() {
                 if let Op::Set(v) = op {
                     if v.is_empty() {
-                        self.wal_text = text;
-                        self.next_seq = start_seq;
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
                             "a set with an empty value would delete the scroll; use Op::Delete",
@@ -462,30 +510,33 @@ impl Core {
                 entries.iter().map(|(c, s)| (*c, s.as_str())).collect();
             let marker = phext::commit_scroll(&pairs);
             entries.push((entry_coord(seq, txn.ops.len() + 1), marker));
-            let refs: Vec<(Coordinate, &str)> =
-                entries.iter().map(|(c, s)| (*c, s.as_str())).collect();
-            text = match phext::append_batch(text, &refs) {
-                Some(t) => t,
-                None => {
-                    // Unreachable by construction (sequences strictly
-                    // increase); if it ever fires, restore the WAL
-                    // text from disk rather than trust memory.
-                    self.wal_text = std::fs::read_to_string(&self.wal_path)?;
-                    self.next_seq = start_seq;
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "WAL append rejected: coordinate order",
-                    ));
-                }
-            };
+            all_entries.push(entries);
             seqs.push(seq);
-            self.next_seq += 1;
         }
+        // Extend the log from the append cursor: the suffix is
+        // O(batch). libphext::append_batch re-parses the document
+        // on every call — right for a stateless library that cannot
+        // know the end position, quadratic when chained per
+        // transaction (the second defect this integration found).
+        // The engine knows exactly where its WAL ends.
+        let mut text = std::mem::take(&mut self.wal_text);
+        let mut cursor = self.wal_last;
+        let mut bytes: Vec<u8> = Vec::new();
+        for entries in &all_entries {
+            for (coord, content) in entries {
+                emit_until(&mut bytes, &mut cursor, comps(coord));
+                bytes.extend_from_slice(content.as_bytes());
+            }
+        }
+        let suffix = String::from_utf8(bytes).expect("WAL suffix is valid UTF-8");
+        text.push_str(&suffix);
+        self.next_seq = start_seq + seqs.len() as u64;
         // one write, one sync — then, and only then, apply
         let wal = self.wal_file()?;
         wal.write_all(&text.as_bytes()[old_len..])?;
         wal.sync_data()?;
         self.wal_text = text;
+        self.wal_last = cursor;
         for (txn, &seq) in txns.iter().zip(&seqs) {
             let mut next = (**self.shared.overlay.read().unwrap()).clone();
             for (coord, op) in &txn.ops {
@@ -534,6 +585,7 @@ impl Core {
         let mut m = HashMap::new();
         m.insert(meta_coord(), meta_content(self.checkpoint_seq));
         self.wal_text = phext::implode(m);
+        self.wal_last = comps(&meta_coord());
         // clone before taking the file handle: wal_file() borrows
         // all of self mutably, and the meta text is a few dozen bytes
         let meta = self.wal_text.clone();
