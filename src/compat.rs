@@ -133,11 +133,12 @@ impl LatticeStore {
         self.staged.clear();
     }
 
-    /// Commits the staged changes as one transaction, then
-    /// checkpoints — after `save`, the base file at `path()` is the
-    /// complete merged document, as with `MappedLattice::save`.
-    pub fn save(&mut self) -> io::Result<()> {
+    /// Commits the staged changes as one transaction, without
+    /// checkpointing. On failure the staged edits are restored —
+    /// a failed commit consumes nothing.
+    pub fn commit_staged(&mut self) -> io::Result<()> {
         if !self.staged.is_empty() {
+            let backup = self.staged.clone();
             let ops: Vec<(Coordinate, Op)> = std::mem::take(&mut self.staged)
                 .into_iter()
                 .map(|(c, v)| {
@@ -150,9 +151,26 @@ impl LatticeStore {
                     })
                 })
                 .collect();
-            self.core.commit_batch(vec![crate::core::Txn { ops }])?;
+            if let Err(e) = self.core.commit_batch(vec![crate::core::Txn { ops }]) {
+                self.staged = backup;
+                return Err(e);
+            }
         }
+        Ok(())
+    }
+
+    /// Folds all committed state into the base file (see
+    /// `Core::checkpoint`).
+    pub fn checkpoint(&mut self) -> io::Result<()> {
         self.core.checkpoint()
+    }
+
+    /// Commits the staged changes as one transaction, then
+    /// checkpoints — after `save`, the base file at `path()` is the
+    /// complete merged document, as with `MappedLattice::save`.
+    pub fn save(&mut self) -> io::Result<()> {
+        self.commit_staged()?;
+        self.checkpoint()
     }
 
     /// The merged document (base + committed overlay + staged),

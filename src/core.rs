@@ -211,7 +211,9 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 pub struct Core {
     base_path: PathBuf,
     wal_path: PathBuf,
-    wal_file: File,
+    /// Opened lazily on the first write: opening a store read-only
+    /// must not create the WAL file beside the document.
+    wal_file: Option<File>,
     wal_text: String,
     next_seq: u64,
     checkpoint_seq: u64,
@@ -289,12 +291,7 @@ impl Core {
             f.sync_all()?;
         }
 
-        let mut wal_file = OpenOptions::new().append(true).create(true).open(&wal_path)?;
-        if !wal_existed {
-            wal_file.write_all(wal_text.as_bytes())?;
-            wal_file.sync_all()?;
-        }
-        wal_file.seek(SeekFrom::End(0))?;
+        let _ = wal_existed;
 
         let shared = Arc::new(Shared {
             base: RwLock::new(Arc::new(base)),
@@ -304,7 +301,7 @@ impl Core {
         Ok(Core {
             base_path: base_path.to_path_buf(),
             wal_path,
-            wal_file,
+            wal_file: None,
             wal_text,
             next_seq: applied_seq + 1,
             checkpoint_seq,
@@ -343,6 +340,13 @@ fn entry_body(coord: &Coordinate, op: &Op) -> String {
 }
 
 impl Core {
+    fn wal_file(&mut self) -> io::Result<&mut File> {
+        if self.wal_file.is_none() {
+            self.wal_file = Some(OpenOptions::new().append(true).create(true).open(&self.wal_path)?);
+        }
+        Ok(self.wal_file.as_mut().unwrap())
+    }
+
     pub fn seq(&self) -> u64 {
         self.shared.seq()
     }
@@ -414,8 +418,9 @@ impl Core {
             self.next_seq += 1;
         }
         // one write, one sync — then, and only then, apply
-        self.wal_file.write_all(&text.as_bytes()[old_len..])?;
-        self.wal_file.sync_data()?;
+        let wal = self.wal_file()?;
+        wal.write_all(&text.as_bytes()[old_len..])?;
+        wal.sync_data()?;
         self.wal_text = text;
         for (txn, &seq) in txns.iter().zip(&seqs) {
             let mut next = (**self.shared.overlay.read().unwrap()).clone();
@@ -465,10 +470,11 @@ impl Core {
         let mut m = HashMap::new();
         m.insert(meta_coord(), meta_content(self.checkpoint_seq));
         self.wal_text = phext::implode(m);
-        self.wal_file.set_len(0)?;
-        self.wal_file.seek(SeekFrom::Start(0))?;
-        self.wal_file.write_all(self.wal_text.as_bytes())?;
-        self.wal_file.sync_all()?;
+        let wal = self.wal_file()?;
+        wal.set_len(0)?;
+        wal.seek(SeekFrom::Start(0))?;
+        wal.write_all(self.wal_text.as_bytes())?;
+        wal.sync_all()?;
 
         *self.shared.base.write().unwrap() = Arc::new(BaseLattice::open(&self.base_path)?);
         *self.shared.overlay.write().unwrap() = Arc::new(BTreeMap::new());

@@ -172,3 +172,19 @@ async fn a_torn_commit_marker_is_discarded() {
     assert_eq!(store.seq(), 1);
     cleanup(&base);
 }
+
+#[tokio::test]
+async fn read_only_open_creates_no_wal_file() {
+    let base = temp_store("lazy-wal");
+    let a = coord("1.1.1/1.1.1/1.1.1");
+    std::fs::write(&base, "seed content").unwrap();
+    let wal = base.with_file_name("store.wal.phext");
+    {
+        let store = HoloPhext::open(&base).await.unwrap();
+        assert_eq!(store.read(&a).as_deref(), Some("seed content"));
+        assert!(!wal.exists(), "a read-only open must not create the WAL");
+        store.commit(Txn::new().set(a, "updated")).await.unwrap();
+        assert!(wal.exists(), "the first commit creates the WAL");
+    }
+    cleanup(&base);
+}
