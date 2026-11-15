@@ -1,0 +1,16 @@
+[package]
+name = "holo-phext"
+version = "0.1.0"
+edition = "2021"
+description = "Layer2 over phext: a memory-mapped lattice with async I/O, update dispatch, and ACID multi-scroll transactions. The storage engine phext-lattice will be re-implemented on, and the durability layer for phext-native stores (HoloStore round 2)."
+license = "MIT"
+repository = "https://github.com/wbic16/holo-phext"
+
+[dependencies]
+# libphext 0.6.2 supplies the content conventions this engine builds on
+# (checked scrolls, commit markers, append batches). Pinned to the 0.6.2
+# branch tip until 0.6.2 is published to crates.io from a tagged exo
+# tree; then this becomes `libphext = "0.6.2"`.
+libphext = { git = "https://github.com/wbic16/libphext-rs", rev = "af3867c", features = ["binary"] }
+memmap2 = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
