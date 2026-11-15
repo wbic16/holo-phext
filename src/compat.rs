@@ -52,16 +52,29 @@ impl LatticeStore {
     }
 
     pub fn write_scroll(&mut self, coord: Coordinate, content: String) -> bool {
-        if content.is_empty() {
-            self.staged.insert(coord, None);
-        } else {
-            self.staged.insert(coord, Some(content));
-        }
+        // Staged verbatim — including an empty string, which reads
+        // back as Some("") while staged (MappedLattice parity). At
+        // commit time an empty value cannot exist as a scroll, so
+        // `save` translates it to a delete — the same end state the
+        // original serializer produced by dropping it from the file.
+        self.staged.insert(coord, Some(content));
         true
     }
 
     pub fn delete_scroll(&mut self, coord: Coordinate) {
-        self.staged.insert(coord, None);
+        let in_base = self.core.shared.snapshot().get(&coord).is_some();
+        match self.staged.get(&coord) {
+            Some(Some(_)) if !in_base => {
+                // staged insert of a scroll that exists nowhere else:
+                // deleting it removes the entry, as the original
+                // overlay did — no pending change remains
+                self.staged.remove(&coord);
+            }
+            _ if in_base || self.staged.contains_key(&coord) => {
+                self.staged.insert(coord, None);
+            }
+            _ => {}
+        }
     }
 
     pub fn has_scroll(&self, coord: &Coordinate) -> bool {
@@ -98,6 +111,24 @@ impl LatticeStore {
         self.staged.len()
     }
 
+    /// Coordinates with staged edits, sorted.
+    pub fn pending_coordinates(&self) -> Vec<Coordinate> {
+        self.staged.keys().copied().collect()
+    }
+
+    /// True when nothing is staged and every committed transaction
+    /// has been folded into the base file — the state in which the
+    /// base file's bytes are the whole document.
+    pub fn is_clean(&self) -> bool {
+        self.staged.is_empty() && self.core.seq() == self.core.checkpoint_seq()
+    }
+
+    /// The committed document (base + committed overlay, staged
+    /// edits excluded), serialized.
+    pub fn committed_bytes(&self) -> Vec<u8> {
+        self.merged_bytes(false)
+    }
+
     pub fn revert(&mut self) {
         self.staged.clear();
     }
@@ -109,7 +140,15 @@ impl LatticeStore {
         if !self.staged.is_empty() {
             let ops: Vec<(Coordinate, Op)> = std::mem::take(&mut self.staged)
                 .into_iter()
-                .map(|(c, v)| (c, match v { Some(s) => Op::Set(s), None => Op::Delete }))
+                .map(|(c, v)| {
+                    (c, match v {
+                        // an empty scroll cannot be committed — it
+                        // does not exist — so an empty staged value
+                        // commits as a delete
+                        Some(s) if !s.is_empty() => Op::Set(s),
+                        _ => Op::Delete,
+                    })
+                })
                 .collect();
             self.core.commit_batch(vec![crate::core::Txn { ops }])?;
         }
@@ -119,6 +158,10 @@ impl LatticeStore {
     /// The merged document (base + committed overlay + staged),
     /// serialized — `MappedLattice::to_phext_bytes`.
     pub fn to_phext_bytes(&self) -> Vec<u8> {
+        self.merged_bytes(true)
+    }
+
+    fn merged_bytes(&self, include_staged: bool) -> Vec<u8> {
         let snapshot = self.core.shared.snapshot();
         let base_text = std::str::from_utf8(snapshot.base_bytes()).unwrap_or("");
         let mut map = phext::explode(base_text);
@@ -127,13 +170,15 @@ impl LatticeStore {
                 map.insert(coord, v);
             }
         }
-        for (coord, value) in &self.staged {
-            match value {
-                Some(v) => {
-                    map.insert(*coord, v.clone());
-                }
-                None => {
-                    map.remove(coord);
+        if include_staged {
+            for (coord, value) in &self.staged {
+                match value {
+                    Some(v) => {
+                        map.insert(*coord, v.clone());
+                    }
+                    None => {
+                        map.remove(coord);
+                    }
                 }
             }
         }

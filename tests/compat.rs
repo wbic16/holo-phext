@@ -62,3 +62,32 @@ fn lattice_store_mirrors_mapped_lattice() {
     assert_eq!(store.read_scroll(&b).as_deref(), Some("beta"));
     let _ = std::fs::remove_dir_all(base.parent().unwrap());
 }
+
+#[test]
+fn lattice_store_empty_write_and_delete_parity() {
+    let base = temp_store("parity");
+    let a = coord("1.1.1/1.1.1/1.1.1");
+    let ghost = coord("1.1.1/1.1.1/1.1.9");
+    let mut store = LatticeStore::open(&base).unwrap();
+
+    // an empty write stages verbatim and reads back as Some("")
+    store.write_scroll(a, String::new());
+    assert_eq!(store.read_scroll(&a).as_deref(), Some(""));
+    assert!(store.has_scroll(&a));
+    assert_eq!(store.pending_coordinates(), vec![a]);
+    // at save it cannot be committed — the scroll simply does not exist
+    store.save().unwrap();
+    assert_eq!(store.read_scroll(&a), None);
+    assert!(store.is_clean());
+
+    // deleting a scroll that exists nowhere records no pending change
+    store.delete_scroll(ghost);
+    assert_eq!(store.pending_changes(), 0);
+    // deleting a staged insert removes the entry outright
+    store.write_scroll(ghost, "temp".to_string());
+    assert_eq!(store.pending_changes(), 1);
+    store.delete_scroll(ghost);
+    assert_eq!(store.pending_changes(), 0);
+    assert!(!store.is_dirty());
+    let _ = std::fs::remove_dir_all(base.parent().unwrap());
+}
