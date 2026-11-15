@@ -304,13 +304,10 @@ impl Core {
                 .iter()
                 .map(|c| (*c, exploded.get(c).cloned().unwrap_or_default()))
                 .collect();
-            let commit_body = exploded.get(commit_at).and_then(|raw| {
-                if phext::verify_checked_scroll(raw) {
-                    phext::uncheck_scroll(raw)
-                } else {
-                    None
-                }
-            });
+            // The marker is stored as the bare commit_scroll body
+            // (its integrity is the embedded checksum over the
+            // entries); the entries themselves are checked scrolls.
+            let commit_body = exploded.get(commit_at);
             let mut valid = match &commit_body {
                 Some(body) => {
                     let mut check_input = String::new();
@@ -320,7 +317,7 @@ impl Core {
                         check_input += checked;
                         check_input.push('\n');
                     }
-                    *body
+                    **body
                         == format!(
                             "phext-commit:1\ncount={}\ncheck={}",
                             pairs.len(),
