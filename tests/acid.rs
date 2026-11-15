@@ -241,3 +241,38 @@ fn one_giant_batch_and_a_torn_utf8_tail() {
     drop(core);
     cleanup(&base);
 }
+
+#[test]
+fn batches_apply_as_deltas_and_compact() {
+    // Thousands of single-op batches over a growing map: the apply
+    // path must stay O(batch) (delta append + amortized folds),
+    // and reads must stay correct across compactions.
+    use holo_phext::core::Core;
+    let base = temp_store("deltas");
+    let mut core = Core::open(&base).unwrap();
+    for i in 0..9_000u32 {
+        let key = coord(&format!("1.1.1/1.1.{}/1.1.1", i + 1));
+        core.commit_batch(vec![Txn::new().set(key, &format!("v{i}"))]).unwrap();
+    }
+    let snap = core.shared.snapshot();
+    assert_eq!(snap.seq(), 9_000);
+    assert_eq!(snap.coordinates().len(), 9_000);
+    assert_eq!(
+        snap.get(&coord("1.1.1/1.1.5000/1.1.1")).as_deref(),
+        Some("v4999")
+    );
+    // Overwrite + delete across the compaction boundary.
+    let k = coord("1.1.1/1.1.5000/1.1.1");
+    core.commit_batch(vec![Txn::new().set(k, "updated")]).unwrap();
+    core.commit_batch(vec![Txn::new().delete(k)]).unwrap();
+    assert_eq!(core.shared.snapshot().get(&k), None);
+    assert_eq!(core.shared.snapshot().coordinates().len(), 8_999);
+    drop(core);
+    // And after a checkpoint the folded state is the base itself.
+    let mut core = Core::open(&base).unwrap();
+    assert_eq!(core.shared.snapshot().coordinates().len(), 8_999);
+    core.checkpoint().unwrap();
+    assert_eq!(core.shared.snapshot().coordinates().len(), 8_999);
+    drop(core);
+    cleanup(&base);
+}

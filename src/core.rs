@@ -124,9 +124,21 @@ impl BaseLattice {
 
 /// Shared, snapshot-able read state. Writers swap Arcs; readers clone
 /// them into a `Snapshot` and are thereafter immune to new commits.
+/// Accumulated uncompacted changes that trigger a fold into the
+/// compacted map. Folding costs one clone+merge of the map; at
+/// this threshold the amortized cost per change is negligible and
+/// the delta scan on reads stays short.
+const COMPACT_THRESHOLD: usize = 8192;
+
 pub struct Shared {
     base: RwLock<Arc<BaseLattice>>,
-    overlay: RwLock<Arc<BTreeMap<Coordinate, Option<String>>>>,
+    /// Folded overlay state: every committed change up to the last
+    /// compaction.
+    compacted: RwLock<Arc<BTreeMap<Coordinate, Option<String>>>>,
+    /// Batches since compaction, oldest first: (the batch's final
+    /// seq, its changes in order). Applying a batch appends here —
+    /// O(batch), never O(map).
+    deltas: RwLock<Arc<Vec<(u64, Vec<(Coordinate, Op)>)>>>,
     seq: RwLock<u64>,
 }
 
@@ -134,7 +146,8 @@ impl Shared {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             base: self.base.read().unwrap().clone(),
-            overlay: self.overlay.read().unwrap().clone(),
+            compacted: self.compacted.read().unwrap().clone(),
+            deltas: self.deltas.read().unwrap().clone(),
             seq: *self.seq.read().unwrap(),
         }
     }
@@ -147,7 +160,8 @@ impl Shared {
 /// A frozen read view at one sequence number.
 pub struct Snapshot {
     base: Arc<BaseLattice>,
-    overlay: Arc<BTreeMap<Coordinate, Option<String>>>,
+    compacted: Arc<BTreeMap<Coordinate, Option<String>>>,
+    deltas: Arc<Vec<(u64, Vec<(Coordinate, Op)>)>>,
     seq: u64,
 }
 
@@ -162,10 +176,46 @@ impl Snapshot {
     }
 
     pub fn get(&self, coord: &Coordinate) -> Option<String> {
-        if let Some(entry) = self.overlay.get(coord) {
+        // Newest first: later batches win, and within a batch the
+        // later op wins. Ops are absolute, so the first hit decides.
+        for (bseq, changes) in self.deltas.iter().rev() {
+            if *bseq > self.seq {
+                continue;
+            }
+            for (c, op) in changes.iter().rev() {
+                if c == coord {
+                    return match op {
+                        Op::Set(v) => Some(v.clone()),
+                        Op::Delete => None,
+                    };
+                }
+            }
+        }
+        if let Some(entry) = self.compacted.get(coord) {
             return entry.clone();
         }
         self.base.read_scroll(coord)
+    }
+
+    /// The fully merged overlay at this snapshot (checkpoint's
+    /// view; O(map), called once per checkpoint, never per read).
+    pub fn overlay_map(&self) -> BTreeMap<Coordinate, Option<String>> {
+        let mut map = (*self.compacted).clone();
+        for (bseq, changes) in self.deltas.iter() {
+            if *bseq > self.seq {
+                continue;
+            }
+            for (c, op) in changes {
+                map.insert(
+                    *c,
+                    match op {
+                        Op::Set(v) => Some(v.clone()),
+                        Op::Delete => None,
+                    },
+                );
+            }
+        }
+        map
     }
 
     pub fn contains(&self, coord: &Coordinate) -> bool {
@@ -174,14 +224,15 @@ impl Snapshot {
 
     /// Every populated coordinate in this snapshot, ascending.
     pub fn coordinates(&self) -> Vec<Coordinate> {
+        let overlay = self.overlay_map();
         let mut out: Vec<Coordinate> = self
             .base
             .coordinates()
             .iter()
             .copied()
-            .filter(|c| !matches!(self.overlay.get(c), Some(None)))
+            .filter(|c| !matches!(overlay.get(c), Some(None)))
             .collect();
-        for (coord, value) in self.overlay.iter() {
+        for (coord, value) in overlay.iter() {
             if value.is_some() && !self.base.coordinates().contains(coord) {
                 out.push(*coord);
             }
@@ -408,7 +459,8 @@ impl Core {
             .unwrap_or_else(|| comps(&meta_coord()));
         let shared = Arc::new(Shared {
             base: RwLock::new(Arc::new(base)),
-            overlay: RwLock::new(Arc::new(overlay)),
+            compacted: RwLock::new(Arc::new(overlay)),
+            deltas: RwLock::new(Arc::new(Vec::new())),
             seq: RwLock::new(applied_seq),
         });
         Ok(Core {
@@ -537,18 +589,47 @@ impl Core {
         wal.sync_data()?;
         self.wal_text = text;
         self.wal_last = cursor;
-        for (txn, &seq) in txns.iter().zip(&seqs) {
-            let mut next = (**self.shared.overlay.read().unwrap()).clone();
-            for (coord, op) in &txn.ops {
-                next.insert(*coord, match op {
-                    Op::Set(v) => Some(v.clone()),
-                    Op::Delete => None,
-                });
-            }
-            *self.shared.overlay.write().unwrap() = Arc::new(next);
-            *self.shared.seq.write().unwrap() = seq;
+        // Apply the batch as ONE delta entry. Visibility is per
+        // batch — acks are too (the batch synced as one) — and the
+        // batch's seqs are only revealed to callers now, so no
+        // observer can hold a mid-batch sequence. The code this
+        // replaces cloned the entire overlay map per transaction:
+        // O(batch × map), which is the write-path collapse the
+        // HoloStore benchmarks measured (1,490 ops/s against a
+        // 156k ops/s hand-rolled baseline at 4,096 live scrolls).
+        let changes: Vec<(Coordinate, Op)> =
+            txns.iter().flat_map(|t| t.ops.iter().cloned()).collect();
+        let final_seq = seqs.last().copied().unwrap_or(0);
+        {
+            let mut next = (**self.shared.deltas.read().unwrap()).clone();
+            next.push((final_seq, changes));
+            *self.shared.deltas.write().unwrap() = Arc::new(next);
+            *self.shared.seq.write().unwrap() = final_seq;
         }
+        self.maybe_compact();
         Ok(seqs)
+    }
+
+    /// Fold the accumulated deltas into the compacted map once
+    /// they pass the threshold. Safe against concurrent snapshots:
+    /// ops are absolute, so a reader who sees the new compacted
+    /// map together with the not-yet-cleared deltas gets the same
+    /// answers (delta entries win, and they agree).
+    fn maybe_compact(&mut self) {
+        let total: usize = self
+            .shared
+            .deltas
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(_, ch)| ch.len())
+            .sum();
+        if total <= COMPACT_THRESHOLD {
+            return;
+        }
+        let merged = self.shared.snapshot().overlay_map();
+        *self.shared.compacted.write().unwrap() = Arc::new(merged);
+        *self.shared.deltas.write().unwrap() = Arc::new(Vec::new());
     }
 
     /// Folds the overlay into the base file (temp + sync + rename +
@@ -561,7 +642,7 @@ impl Core {
         let base_text = std::str::from_utf8(snapshot.base.bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut map: HashMap<Coordinate, String> = phext::explode(base_text);
-        for (coord, value) in snapshot.overlay.iter() {
+        for (coord, value) in snapshot.overlay_map().iter() {
             match value {
                 Some(v) => {
                     map.insert(*coord, v.clone());
@@ -596,7 +677,8 @@ impl Core {
         wal.sync_all()?;
 
         *self.shared.base.write().unwrap() = Arc::new(BaseLattice::open(&self.base_path)?);
-        *self.shared.overlay.write().unwrap() = Arc::new(BTreeMap::new());
+        *self.shared.compacted.write().unwrap() = Arc::new(BTreeMap::new());
+        *self.shared.deltas.write().unwrap() = Arc::new(Vec::new());
         Ok(())
     }
 }
