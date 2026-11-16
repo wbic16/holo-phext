@@ -172,3 +172,107 @@ async fn a_torn_commit_marker_is_discarded() {
     assert_eq!(store.seq(), 1);
     cleanup(&base);
 }
+
+#[tokio::test]
+async fn read_only_open_creates_no_wal_file() {
+    let base = temp_store("lazy-wal");
+    let a = coord("1.1.1/1.1.1/1.1.1");
+    std::fs::write(&base, "seed content").unwrap();
+    let wal = base.with_file_name("store.wal.phext");
+    {
+        let store = HoloPhext::open(&base).await.unwrap();
+        assert_eq!(store.read(&a).as_deref(), Some("seed content"));
+        assert!(!wal.exists(), "a read-only open must not create the WAL");
+        store.commit(Txn::new().set(a, "updated")).await.unwrap();
+        assert!(wal.exists(), "the first commit creates the WAL");
+    }
+    cleanup(&base);
+}
+
+#[tokio::test]
+async fn recovery_over_many_transactions_is_linear() {
+    // Regression: recovery once verified each transaction by
+    // fetching from the raw WAL text — a whole-document parse per
+    // transaction, quadratic in the log. 3,000 transactions must
+    // reopen with every value intact, inside ordinary test time.
+    let base = temp_store("many");
+    let key = coord("9.9.9/9.9.9/9.9.9");
+    {
+        let store = HoloPhext::open(&base).await.unwrap();
+        for i in 0..3_000u32 {
+            store.commit(Txn::new().set(key, &format!("v{i}"))).await.unwrap();
+        }
+    }
+    let store = HoloPhext::open(&base).await.unwrap();
+    assert_eq!(store.seq(), 3_000);
+    assert_eq!(store.read(&key).as_deref(), Some("v2999"));
+    drop(store);
+    cleanup(&base);
+}
+
+#[test]
+fn one_giant_batch_and_a_torn_utf8_tail() {
+    // The HoloStore server's shape: thousands of transactions in
+    // ONE commit_batch, then a crash that splits a UTF-8 sequence
+    // at the WAL's tail. Both were defects when the engine chained
+    // libphext::append_batch per transaction and read the WAL with
+    // read_to_string.
+    use holo_phext::core::Core;
+    let base = temp_store("giant");
+    let key = coord("9.9.9/9.9.9/9.9.9");
+    let mut core = Core::open(&base).unwrap();
+    let txns: Vec<Txn> = (0..3_000u32)
+        .map(|i| Txn::new().set(key, &format!("v{i}")))
+        .collect();
+    let seqs = core.commit_batch(txns).unwrap();
+    assert_eq!(seqs.len(), 3_000);
+    assert_eq!(core.shared.snapshot().get(&key).as_deref(), Some("v2999"));
+    drop(core);
+    // Torn tail: partial scroll, then bytes that are not UTF-8.
+    let wal = base.with_file_name("store.wal.phext");
+    let mut f = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+    use std::io::Write;
+    f.write_all(b"\x1c\x19partial").unwrap();
+    f.write_all(&[0xFF, 0xFE, 0x00]).unwrap();
+    drop(f);
+    let core = Core::open(&base).unwrap();
+    assert_eq!(core.seq(), 3_000);
+    assert_eq!(core.shared.snapshot().get(&key).as_deref(), Some("v2999"));
+    drop(core);
+    cleanup(&base);
+}
+
+#[test]
+fn batches_apply_as_deltas_and_compact() {
+    // Thousands of single-op batches over a growing map: the apply
+    // path must stay O(batch) (delta append + amortized folds),
+    // and reads must stay correct across compactions.
+    use holo_phext::core::Core;
+    let base = temp_store("deltas");
+    let mut core = Core::open(&base).unwrap();
+    for i in 0..9_000u32 {
+        let key = coord(&format!("1.1.1/1.1.{}/1.1.1", i + 1));
+        core.commit_batch(vec![Txn::new().set(key, &format!("v{i}"))]).unwrap();
+    }
+    let snap = core.shared.snapshot();
+    assert_eq!(snap.seq(), 9_000);
+    assert_eq!(snap.coordinates().len(), 9_000);
+    assert_eq!(
+        snap.get(&coord("1.1.1/1.1.5000/1.1.1")).as_deref(),
+        Some("v4999")
+    );
+    // Overwrite + delete across the compaction boundary.
+    let k = coord("1.1.1/1.1.5000/1.1.1");
+    core.commit_batch(vec![Txn::new().set(k, "updated")]).unwrap();
+    core.commit_batch(vec![Txn::new().delete(k)]).unwrap();
+    assert_eq!(core.shared.snapshot().get(&k), None);
+    assert_eq!(core.shared.snapshot().coordinates().len(), 8_999);
+    drop(core);
+    // And after a checkpoint the folded state is the base itself.
+    let mut core = Core::open(&base).unwrap();
+    assert_eq!(core.shared.snapshot().coordinates().len(), 8_999);
+    core.checkpoint().unwrap();
+    assert_eq!(core.shared.snapshot().coordinates().len(), 8_999);
+    drop(core);
+    cleanup(&base);
+}
