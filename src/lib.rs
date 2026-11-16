@@ -32,7 +32,7 @@ pub mod core;
 pub mod index;
 
 pub use core::{Core, Op, Snapshot, Txn};
-pub use index::LatticeIndex;
+pub use index::{Dimension, LatticeIndex, ScrollSpan};
 use libphext::phext::Coordinate;
 use std::io;
 use std::path::Path;
