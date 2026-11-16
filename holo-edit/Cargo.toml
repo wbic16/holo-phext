@@ -1,0 +1,15 @@
+[package]
+name = "holo-edit"
+version = "0.1.0"
+edition = "2021"
+description = "Host surface for holo-phext: phext-edit's HTTP API over holo_phext::core::Core (holo-edit), plus a corpus parity listing tool (holo-dump). Lets non-Rust phext consumers drive the engine unchanged."
+license = "MIT"
+repository = "https://github.com/wbic16/holo-phext"
+
+[dependencies]
+holo-phext = { path = ".." }
+libphext = { git = "https://github.com/wbic16/libphext-rs", rev = "af3867c", features = ["binary"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

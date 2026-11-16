@@ -14,3 +14,7 @@ repository = "https://github.com/wbic16/holo-phext"
 libphext = { git = "https://github.com/wbic16/libphext-rs", rev = "af3867c", features = ["binary"] }
 memmap2 = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[workspace]
+members = ["holo-edit"]
+resolver = "2"
