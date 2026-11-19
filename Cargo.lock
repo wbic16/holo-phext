@@ -10,7 +10,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "holo-phext"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "libphext",
  "memmap2",
@@ -25,8 +25,9 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libphext"
-version = "0.6.2"
-source = "git+https://github.com/wbic16/libphext-rs?rev=af3867c#af3867cf7ccc798ca4b785a37427eb49db5ee906"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bce8bc723940d1ad011a54ec3d84801aa34e02ed078bcc3c6506236aea6a06ff"
 dependencies = [
  "base64",
  "xxhash-rust",

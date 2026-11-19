@@ -1,16 +1,17 @@
 [package]
 name = "holo-phext"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Layer2 over phext: a memory-mapped lattice with async I/O, update dispatch, and ACID multi-scroll transactions. The storage engine phext-lattice will be re-implemented on, and the durability layer for phext-native stores (HoloStore round 2)."
 license = "MIT"
 repository = "https://github.com/wbic16/holo-phext"
 
 [dependencies]
-# libphext 0.6.2 supplies the content conventions this engine builds on
-# (checked scrolls, commit markers, append batches). Pinned to the 0.6.2
-# branch tip until 0.6.2 is published to crates.io from a tagged exo
-# tree; then this becomes `libphext = "0.6.2"`.
-libphext = { git = "https://github.com/wbic16/libphext-rs", rev = "af3867c", features = ["binary"] }
+# libphext 0.6.4 supplies the content conventions this engine builds on
+# (checked scrolls, commit markers, append batches, span index, TOC
+# modes). 0.6.4 is published to crates.io from the tagged v0.6.4 exo
+# tree; phext-lattice resolves the same crates.io 0.6.4, so both crates
+# share exactly one libphext and Coordinate is one type.
+libphext = { version = "0.6.4", features = ["binary"] }
 memmap2 = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
